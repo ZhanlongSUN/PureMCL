@@ -1,12 +1,14 @@
 #include "internal.h"
 #include <bcrypt.h>
 
-NmcError nmc_hash_file(const wchar_t *path, size_t digits, char out[65], NmcTask *task) {
+NmcError nmc_hash_file(const wchar_t *path, size_t digits, char *out, NmcTask *task) {
     BCRYPT_ALG_HANDLE alg=NULL; BCRYPT_HASH_HANDLE h=NULL;
     HANDLE f=INVALID_HANDLE_VALUE; uint64_t ignored;
-    unsigned char *buf=NULL, hash[32];
+    unsigned char *buf=NULL, hash[64];
     NmcError e=OK; NTSTATUS status;
-    if (digits!=40 && digits!=64) return ERR(NMC_HASH,L"digest algorithm");
+    LPCWSTR algorithm=digits==40?BCRYPT_SHA1_ALGORITHM:digits==64?BCRYPT_SHA256_ALGORITHM:
+        digits==128?BCRYPT_SHA512_ALGORITHM:NULL;
+    if (!algorithm) return ERR(NMC_HASH,L"digest algorithm");
     if (!nmc_file_size(path,&ignored)) return ERR(NMC_MISSING,L"hash input");
     f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,
                   FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_SEQUENTIAL_SCAN,NULL);
@@ -15,7 +17,7 @@ NmcError nmc_hash_file(const wchar_t *path, size_t digits, char out[65], NmcTask
     if (!GetFileInformationByHandle(f,&info) || (info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)) {
         e=ERR(NMC_PATH_ERROR,L"hash input type"); goto done;
     }
-    status=BCryptOpenAlgorithmProvider(&alg,digits==40 ? BCRYPT_SHA1_ALGORITHM : BCRYPT_SHA256_ALGORITHM,NULL,0);
+    status=BCryptOpenAlgorithmProvider(&alg,algorithm,NULL,0);
     if (status<0) goto hash_error;
     status=BCryptCreateHash(alg,&h,NULL,0,NULL,0,0);
     if (status<0) goto hash_error;
@@ -46,11 +48,15 @@ done:
 NmcError nmc_check_file(const NmcFile *f, bool verify, NmcTask *t) {
     uint64_t size;
     if (!nmc_file_size(f->path,&size)) return ERR(NMC_MISSING,L"dependency file");
-    if (size!=f->size) return ERR(NMC_HASH,L"dependency size");
-    if (verify) {
-        char digest[65];
+    if (f->size!=NMC_SIZE_UNKNOWN && size!=f->size) return ERR(NMC_HASH,L"dependency size");
+    if (verify && f->hash[0]) {
+        char digest[129];
         CHECK(nmc_hash_file(f->path,strlen(f->hash),digest,t));
         if (strcmp(digest,f->hash)) return ERR(NMC_HASH,L"dependency digest");
+        if (f->hash512[0]) {
+            CHECK(nmc_hash_file(f->path,128,digest,t));
+            if (strcmp(digest,f->hash512)) return ERR(NMC_HASH,L"dependency SHA-512");
+        }
     }
     return OK;
 }

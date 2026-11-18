@@ -7,6 +7,8 @@
 #include <wincodec.h>
 typedef struct IDWriteFactory IDWriteFactory;
 
+#define NMC_STATUS_HEIGHT 102
+
 typedef struct {
     ID2D1Factory *d2d;
     IDWriteFactory *write;
@@ -22,7 +24,7 @@ void nmc_renderer_init(NmcRenderer *);
 void nmc_renderer_reset(NmcRenderer *);
 void nmc_renderer_free(NmcRenderer *);
 void nmc_renderer_draw(NmcRenderer *,HWND,UINT,bool,const wchar_t *,const wchar_t *);
-int nmc_ui_run(HINSTANCE,int,LARGE_INTEGER);
+int nmc_ui_run(HINSTANCE,int);
 
 #endif
 

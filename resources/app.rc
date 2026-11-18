@@ -1,4 +1,7 @@
 #include <windows.h>
+#include "resource.h"
+
 1 RT_MANIFEST "app.manifest"
-101 RCDATA "mark.png"
+IDI_PUREMCL ICON "mark.ico"
+IDR_MARK_PNG RCDATA "mark.png"
 

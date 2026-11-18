@@ -8,6 +8,11 @@ static NmcError expand(NmcArgs *a,const char *s,const Variable *vars,size_t coun
     wchar_t *w=malloc((size_t)len*sizeof(wchar_t)); NmcWide result={0}; NmcError e=OK;
     if (!w) return ERR(NMC_MEMORY,L"argument text");
     if (!nmc_utf16(s,w,(size_t)len)) { e=ERR(NMC_JSON,L"argument encoding"); goto done; }
+    if (!strstr(s,"\x24{")) {
+        if (nmc_args_take(a,w)) return OK;
+        e=ERR(NMC_MEMORY,L"argument list");
+        goto done;
+    }
     const wchar_t *p=w;
     while (*p) {
         const wchar_t *next=wcsstr(p,L"\x24{");
@@ -27,7 +32,10 @@ static NmcError expand(NmcArgs *a,const char *s,const Variable *vars,size_t coun
         if (!nmc_wide_add(&result,value,wcslen(value))) { e=ERR(NMC_MEMORY,L"expanded argument"); break; }
         p=end+1;
     }
-    if (!e.code && !nmc_args_add(a,result.data?result.data:L"")) e=ERR(NMC_MEMORY,L"argument list");
+    if (!e.code) {
+        if (!nmc_args_take(a,result.data)) e=ERR(NMC_MEMORY,L"argument list");
+        else result.data=NULL;
+    }
 done:
     if (result.data) SecureZeroMemory(result.data,result.len*sizeof(wchar_t));
     free(result.data); free(w); return e;
@@ -88,6 +96,7 @@ NmcError nmc_args_build(const NmcConfig *c,const NmcPlan *p,const NmcSession *s,
         !nmc_utf16(s->client,client,NMC_ARRAY(client)) || !nmc_utf16(id,ver,NMC_ARRAY(ver)) ||
         !nmc_utf16(p->asset_id,asset,NMC_ARRAY(asset)) || !nmc_utf16(p->type,type,NMC_ARRAY(type)) ||
         !nmc_join(libraries,c->root,L"libraries")) return ERR(NMC_JSON,L"launch variables");
+    if (p->loader_libs[0]) wcscpy(libraries,p->loader_libs);
     snprintf(rel,sizeof(rel),"virtual/%s",p->asset_id);
     if (!nmc_path(legacy,p->assets,rel)) { e=ERR(NMC_PATH_ERROR,L"legacy assets path"); goto done; }
     if (p->map_assets) {

@@ -28,6 +28,7 @@ ctest --test-dir "%NMC_BUILD_DIR%" --output-on-failure || exit /b 1
 if /i not "%NMC_BUILD_TYPE%"=="Release" goto built
 cmake --install "%NMC_BUILD_DIR%" --prefix "%~dp0out\portable" || exit /b 1
 echo Portable launcher: "%~dp0out\portable\PureMCL.exe"
+echo Optional log monitor: "%~dp0out\portable\PureMCLMonitor.exe"
 :built
 exit /b 0
 :missing_msvc

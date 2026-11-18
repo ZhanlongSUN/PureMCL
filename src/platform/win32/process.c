@@ -39,7 +39,8 @@ NmcError nmc_process_idle(const wchar_t *path) {
     CloseHandle(p); return e;
 }
 NmcError nmc_spawn(const wchar_t *exe,const wchar_t *dir,const NmcArgs *args,
-                   const wchar_t *lock_path,unsigned long *pid) {
+                   const wchar_t *lock_path,unsigned long *pid,HANDLE *child) {
+    if (child) *child=NULL;
     NmcWide cmd={0}; STARTUPINFOW si={.cb=sizeof(si)}; PROCESS_INFORMATION pi={0};
     NmcError e=nmc_command(exe,args,&cmd);
     if (!e.code && cmd.len>=32767) e=ERR(NMC_UNSUPPORTED,L"command line exceeds Windows limit");
@@ -55,11 +56,81 @@ NmcError nmc_spawn(const wchar_t *exe,const wchar_t *dir,const NmcArgs *args,
         }
         if (!e.code && ResumeThread(pi.hThread)==(DWORD)-1) e=SYS(NMC_PROCESS,L"resume game process");
         if (e.code) TerminateProcess(pi.hProcess,1); /* Never leave our suspended child behind. */
-        else if (pid) *pid=pi.dwProcessId;
-        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        else {
+            if (pid) *pid=pi.dwProcessId;
+            if (child) { *child=pi.hProcess; pi.hProcess=NULL; }
+        }
+        CloseHandle(pi.hThread);
+        if (pi.hProcess) CloseHandle(pi.hProcess);
     }
     if (cmd.data) SecureZeroMemory(cmd.data,cmd.len*sizeof(wchar_t));
     free(cmd.data); return e;
+}
+NmcError nmc_start_watch(HANDLE game,const wchar_t *dir,HANDLE *watcher) {
+    if (watcher) *watcher=NULL;
+    wchar_t exe[NMC_PATH], command[NMC_PATH+64];
+    DWORD len=GetModuleFileNameW(NULL,exe,NMC_PATH);
+    if (!len || len>=NMC_PATH) return ERR(NMC_PATH_ERROR,L"日志监控程序路径");
+    wchar_t *name=wcsrchr(exe,L'\\');
+    if (!name) return ERR(NMC_PATH_ERROR,L"日志监控程序路径");
+    name[1]=0;
+    if (!nmc_join(exe,exe,L"PureMCLMonitor.exe")) return ERR(NMC_PATH_ERROR,L"日志监控程序路径");
+
+    HANDLE inherited=NULL;
+    if (!DuplicateHandle(GetCurrentProcess(),game,GetCurrentProcess(),&inherited,
+                         SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,TRUE,0))
+        return SYS(NMC_PROCESS,L"复制游戏进程句柄");
+    SIZE_T bytes=0;
+    InitializeProcThreadAttributeList(NULL,1,0,&bytes);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs=malloc(bytes);
+    NmcError e=OK;
+    if (!attrs) e=ERR(NMC_MEMORY,L"日志监控进程属性");
+    else if (!InitializeProcThreadAttributeList(attrs,1,0,&bytes))
+        e=SYS(NMC_PROCESS,L"初始化日志监控进程属性");
+    else {
+        if (!UpdateProcThreadAttribute(attrs,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,&inherited,
+                                       sizeof(inherited),NULL,NULL))
+            e=SYS(NMC_PROCESS,L"限定日志监控进程继承的句柄");
+        else if (swprintf(command,NMC_ARRAY(command),L"\"%ls\" %llu",exe,
+                          (unsigned long long)(uintptr_t)inherited)<0)
+            e=ERR(NMC_PATH_ERROR,L"日志监控命令行");
+        else {
+            STARTUPINFOEXW si={.StartupInfo.cb=sizeof(si),.lpAttributeList=attrs};
+            PROCESS_INFORMATION pi={0};
+            if (!CreateProcessW(exe,command,NULL,NULL,TRUE,BELOW_NORMAL_PRIORITY_CLASS|EXTENDED_STARTUPINFO_PRESENT,
+                                NULL,dir,&si.StartupInfo,&pi))
+                e=SYS(NMC_PROCESS,L"启动 PureMCLMonitor.exe");
+            else {
+                CloseHandle(pi.hThread);
+                if (watcher) *watcher=pi.hProcess;
+                else CloseHandle(pi.hProcess);
+            }
+        }
+        DeleteProcThreadAttributeList(attrs);
+    }
+    free(attrs); CloseHandle(inherited);
+    return e;
+}
+NmcError nmc_run_helper(const wchar_t *exe,const wchar_t *dir,const NmcArgs *args,NmcTask *t) {
+    NmcWide cmd={0}; PROCESS_INFORMATION pi={0}; STARTUPINFOW si={.cb=sizeof(si)};
+    NmcError e=nmc_command(exe,args,&cmd);
+    if (!e.code && !CreateProcessW(exe,cmd.data,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,dir,&si,&pi))
+        e=SYS(NMC_PROCESS,L"start installer utility");
+    free(cmd.data);
+    if (e.code) return e;
+    CloseHandle(pi.hThread);
+    DWORD status, code=0;
+    while ((status=WaitForSingleObject(pi.hProcess,100))==WAIT_TIMEOUT) {
+        if (!nmc_cancelled(t)) continue;
+        TerminateProcess(pi.hProcess,1);
+        WaitForSingleObject(pi.hProcess,INFINITE);
+        e=ERR(NMC_CANCELLED,L"installer cancelled"); break;
+    }
+    if (!e.code) {
+        if (status!=WAIT_OBJECT_0 || !GetExitCodeProcess(pi.hProcess,&code)) e=SYS(NMC_PROCESS,L"wait for installer");
+        else if (code) e=(NmcError){NMC_PROCESS,code,L"installer returned an error"};
+    }
+    CloseHandle(pi.hProcess); return e;
 }
 static bool uri(NmcBytes *b,const wchar_t *path) {
     char s[NMC_PATH*3]; static const char hex[]="0123456789ABCDEF";

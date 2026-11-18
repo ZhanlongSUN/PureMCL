@@ -26,6 +26,7 @@ set(nmc_core_sources
   src/storage/integrity.c src/storage/config.c
   src/network/http.c src/network/download.c
   src/core/version.c src/core/runtime.c src/core/arguments.c src/core/launcher.c
+  src/core/loader.c src/core/uninstall.c src/core/pack.c
   src/auth/account.c)
 add_library(nmc_core STATIC ${nmc_core_sources})
 target_include_directories(nmc_core PUBLIC include PRIVATE src)
@@ -37,11 +38,24 @@ target_link_libraries(nmc_core PUBLIC nmc_vendor PRIVATE bcrypt winhttp crypt32 
 
 set(nmc_ui_sources src/main.c src/ui/window.c src/ui/renderer.c)
 add_executable(PureMCL WIN32 ${nmc_ui_sources} resources/app.rc)
-target_include_directories(PureMCL PRIVATE src)
+target_include_directories(PureMCL PRIVATE src resources)
 target_compile_options(PureMCL PRIVATE $<$<COMPILE_LANGUAGE:C>:/W4> $<$<COMPILE_LANGUAGE:C>:/utf-8> $<$<COMPILE_LANGUAGE:C>:/sdl>)
-target_link_libraries(PureMCL PRIVATE nmc_core d2d1 dwrite windowscodecs dwmapi comctl32 gdi32 user32 uxtheme ole32 uuid)
+target_link_libraries(PureMCL PRIVATE nmc_core d2d1 dwrite windowscodecs dwmapi comctl32 comdlg32 gdi32 user32 uxtheme ole32 uuid)
 target_link_options(PureMCL PRIVATE /MANIFEST:NO)
-set_source_files_properties(resources/app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/resources/mark.png")
+set_property(SOURCE resources/app.rc APPEND PROPERTY OBJECT_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest" "${CMAKE_CURRENT_SOURCE_DIR}/resources/mark.png"
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/mark.ico" "${CMAKE_CURRENT_SOURCE_DIR}/resources/resource.h")
+set_property(SOURCE src/ui/window.c src/ui/renderer.c APPEND PROPERTY OBJECT_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/resource.h")
+
+add_executable(PureMCLMonitor WIN32 src/monitor/main.c src/monitor/watch.c resources/monitor.rc)
+target_compile_definitions(PureMCLMonitor PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(PureMCLMonitor PRIVATE $<$<COMPILE_LANGUAGE:C>:/W4> $<$<COMPILE_LANGUAGE:C>:/utf-8> $<$<COMPILE_LANGUAGE:C>:/sdl>)
+target_link_libraries(PureMCLMonitor PRIVATE user32 comctl32 delayimp)
+target_link_options(PureMCLMonitor PRIVATE /MANIFEST:NO /DELAYLOAD:comctl32.dll)
+set_source_files_properties(resources/monitor.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest")
+set_property(SOURCE src/monitor/main.c src/monitor/watch.c
+  APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/monitor/watch.h")
 # Track application headers even when Ninja cannot decode localized /showIncludes.
 set_property(SOURCE ${nmc_core_sources} ${nmc_ui_sources} tests/test_core.c tests/test_graphics.c
   APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/nmc.h" "${CMAKE_CURRENT_SOURCE_DIR}/src/internal.h")
@@ -49,7 +63,7 @@ set_property(SOURCE ${nmc_ui_sources} tests/test_graphics.c APPEND PROPERTY OBJE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/graphics_abi.h")
 set_property(SOURCE src/auth/account.c APPEND PROPERTY OBJECT_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/auth/client_id.h")
-install(TARGETS PureMCL RUNTIME DESTINATION .)
+install(TARGETS PureMCL PureMCLMonitor RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(FILES "${vendor}/miniz/LICENSE" DESTINATION licenses RENAME miniz.txt)
 install(FILES "${vendor}/yyjson/yyjson-0.13.0/LICENSE" DESTINATION licenses RENAME yyjson.txt)
@@ -62,10 +76,20 @@ if(BUILD_TESTING)
   target_link_libraries(nmc_tests PRIVATE nmc_core)
   add_test(NAME nmc_core COMMAND nmc_tests)
   add_executable(nmc_graphics_tests tests/test_graphics.c src/ui/renderer.c resources/app.rc)
-  target_include_directories(nmc_graphics_tests PRIVATE src)
+  target_include_directories(nmc_graphics_tests PRIVATE src resources)
   target_compile_options(nmc_graphics_tests PRIVATE $<$<COMPILE_LANGUAGE:C>:/W4> $<$<COMPILE_LANGUAGE:C>:/utf-8>)
   target_link_libraries(nmc_graphics_tests PRIVATE nmc_core d2d1 dwrite windowscodecs gdi32 user32 ole32 uuid)
   target_link_options(nmc_graphics_tests PRIVATE /MANIFEST:NO)
   add_test(NAME nmc_graphics COMMAND nmc_graphics_tests)
+  add_executable(nmc_watch_tests tests/test_watch.c src/monitor/watch.c)
+  target_include_directories(nmc_watch_tests PRIVATE src)
+  target_compile_options(nmc_watch_tests PRIVATE /W4 /utf-8)
+  target_link_libraries(nmc_watch_tests PRIVATE nmc_core user32)
+  add_dependencies(nmc_watch_tests PureMCLMonitor)
+  set_property(SOURCE tests/test_watch.c APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/monitor/watch.h" "${CMAKE_CURRENT_SOURCE_DIR}/src/internal.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/nmc.h")
+  add_test(NAME nmc_watch COMMAND nmc_watch_tests)
+  set_tests_properties(nmc_watch PROPERTIES TIMEOUT 20)
 endif()
 

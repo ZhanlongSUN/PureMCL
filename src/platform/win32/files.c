@@ -21,12 +21,17 @@ const wchar_t *nmc_error_text(NmcCode code) {
     };
     return (unsigned)code < NMC_ARRAY(labels) ? labels[code] : L"未知错误";
 }
-bool nmc_cancelled(NmcTask *task) { return task && atomic_load(&task->cancel); }
+bool nmc_cancelled(NmcTask *task) { return task && (atomic_load(&task->cancel) || atomic_load(&task->stop_workers)); }
 void nmc_task_reset(NmcTask *t) {
     atomic_init(&t->cancel,false);
-    atomic_init(&t->mirror_hosts,0);
-    atomic_init(&t->mirror_retry_after,0);
+    atomic_init(&t->stop_workers,false);
+    atomic_init(&t->download_region,NMC_REGION_UNCHECKED);
+    for (size_t i=0;i<NMC_ARRAY(t->mirror_retry_after);++i) atomic_init(&t->mirror_retry_after[i],0);
     atomic_init(&t->mirror_announced,false);
+    atomic_init(&t->received_bytes,0);
+    atomic_init(&t->next_transfer_notice,0);
+    t->http_session=NULL;
+    t->watch_error=OK;
 }
 void nmc_progress(NmcTask *t, NmcStage s, size_t i, size_t n) {
     if (t && t->progress) t->progress(t->user, s, i, n);
@@ -53,12 +58,18 @@ bool nmc_wide_add(NmcWide *b, const wchar_t *data, size_t n) {
     b->len += n; b->data[b->len] = 0;
     return true;
 }
-bool nmc_args_add(NmcArgs *a, const wchar_t *s) {
+bool nmc_args_take(NmcArgs *a,wchar_t *owned) {
     if (!nmc_grow((void **)&a->v, &a->cap, a->n+1, sizeof(*a->v))) return false;
-    wchar_t *copy = _wcsdup(s);
-    if (!copy) return false;
-    a->v[a->n++] = copy;
+    a->v[a->n++]=owned;
     return true;
+}
+bool nmc_args_add(NmcArgs *a, const wchar_t *s) {
+    wchar_t *copy=_wcsdup(s);
+    if (!copy) return false;
+    if (nmc_args_take(a,copy)) return true;
+    SecureZeroMemory(copy,wcslen(copy)*sizeof(wchar_t));
+    free(copy);
+    return false;
 }
 void nmc_args_free(NmcArgs *a) {
     for (size_t i=0; i<a->n; ++i) {
@@ -240,6 +251,76 @@ NmcError nmc_write(HANDLE f, const void *data, size_t len) {
         len-=wrote; p+=wrote;
     }
     return OK;
+}
+NmcError nmc_copy_file(const wchar_t *source,const wchar_t *target,NmcTask *t) {
+    CHECK(parent(source,false));
+    HANDLE in=CreateFileW(source,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,
+                          FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_SEQUENTIAL_SCAN,NULL);
+    if (in==INVALID_HANDLE_VALUE) return SYS(NMC_FILE,L"open copy source");
+    BY_HANDLE_FILE_INFORMATION info; HANDLE out=INVALID_HANDLE_VALUE;
+    wchar_t tmp[NMC_PATH]; bool owned=false;
+    unsigned char buf[65536];
+    NmcError e=OK;
+    if (!GetFileInformationByHandle(in,&info) ||
+        (info.dwFileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY))) {
+        e=ERR(NMC_PATH_ERROR,L"unsafe copy source"); goto done;
+    }
+    TRY(nmc_temp(target,tmp,&out)); owned=true;
+    for (;;) {
+        DWORD got=0;
+        if (nmc_cancelled(t)) { e=ERR(NMC_CANCELLED,L"copy cancelled"); goto done; }
+        if (!ReadFile(in,buf,sizeof(buf),&got,NULL)) { e=SYS(NMC_FILE,L"copy read"); goto done; }
+        if (!got) break;
+        TRY(nmc_write(out,buf,got));
+    }
+    CloseHandle(out); out=INVALID_HANDLE_VALUE;
+    TRY(nmc_promote(tmp,target));
+done:
+    if (out!=INVALID_HANDLE_VALUE) CloseHandle(out);
+    if (owned && e.code) DeleteFileW(tmp);
+    CloseHandle(in); return e;
+}
+static NmcError remove_entry(const wchar_t *path,unsigned depth) {
+    DWORD attr=GetFileAttributesW(path);
+    if (attr==INVALID_FILE_ATTRIBUTES) {
+        DWORD error=GetLastError();
+        return error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND?OK:nmc_winerr(NMC_FILE,error,L"uninstall attributes");
+    }
+    if (depth>512) return ERR(NMC_PATH_ERROR,L"uninstall directory depth");
+    if ((attr&FILE_ATTRIBUTE_DIRECTORY) && !(attr&FILE_ATTRIBUTE_REPARSE_POINT)) {
+        wchar_t *child=malloc(NMC_PATH*sizeof(*child)); WIN32_FIND_DATAW data;
+        if (!child) return ERR(NMC_MEMORY,L"uninstall directory");
+        if (!nmc_join(child,path,L"*")) { free(child); return ERR(NMC_PATH_ERROR,L"uninstall directory"); }
+        HANDLE find=FindFirstFileW(child,&data);
+        NmcError e=OK;
+        if (find==INVALID_HANDLE_VALUE && GetLastError()!=ERROR_FILE_NOT_FOUND)
+            e=SYS(NMC_FILE,L"enumerate uninstall directory");
+        if (find!=INVALID_HANDLE_VALUE) {
+            do {
+                if (!wcscmp(data.cFileName,L".") || !wcscmp(data.cFileName,L"..")) continue;
+                if (!nmc_join(child,path,data.cFileName)) { e=ERR(NMC_PATH_ERROR,L"uninstall child"); break; }
+                e=remove_entry(child,depth+1);
+                if (e.code) break;
+            } while (FindNextFileW(find,&data));
+            if (!e.code && GetLastError()!=ERROR_NO_MORE_FILES) e=SYS(NMC_FILE,L"enumerate uninstall directory");
+            FindClose(find);
+        }
+        free(child);
+        CHECK(e);
+    }
+    if (attr&FILE_ATTRIBUTE_DIRECTORY)
+        return RemoveDirectoryW(path)?OK:SYS(NMC_FILE,L"remove game directory");
+    return DeleteFileW(path)?OK:SYS(NMC_FILE,L"remove game file");
+}
+NmcError nmc_remove_tree(const wchar_t *root,const wchar_t *path) {
+    size_t n=wcslen(root);
+    if (!n || n>=wcslen(path) || _wcsnicmp(root,path,n) || path[n]!=L'\\' ||
+        wcsstr(path,L"\\..\\") || wcsstr(path,L"\\.\\"))
+        return ERR(NMC_PATH_ERROR,L"uninstall path outside its base");
+    NmcError e=parent(path,false);
+    if (e.code==NMC_MISSING) return OK;
+    CHECK(e);
+    return remove_entry(path,0);
 }
 NmcError nmc_atomic(const wchar_t *path, const void *data, size_t len) {
     wchar_t tmp[NMC_PATH]; HANDLE f;

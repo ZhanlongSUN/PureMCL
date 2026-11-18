@@ -20,6 +20,7 @@ static bool safe_id(const char *id) {
 }
 NmcError nmc_config_validate(const NmcConfig *c) {
     if (!safe_id(c->instance) || !safe_id(c->version) ||
+        (unsigned)c->loader>NMC_OPTIFINE || (c->loader_version[0] && !safe_id(c->loader_version)) ||
         (c->account[0] && !nmc_hex(c->account,32)) ||
         c->jobs<1 || c->jobs>16 || c->gc>2 || c->xms<128 || c->xms>c->xmx || c->xmx>262144)
         return ERR(NMC_PATH_ERROR,L"instance, version, memory, GC or concurrency");
@@ -31,16 +32,20 @@ NmcError nmc_config_validate(const NmcConfig *c) {
     return OK;
 }
 static NmcError read_instance_json(NmcConfig *c,yyjson_val *r) {
+    c->loader=(NmcLoader)read_uint(r,"loader",NMC_VANILLA);
+    c->loader_version[0]=0;
+    c->loader_profile[0]=0;
     c->xms=read_uint(r,"xms",c->xms); c->xmx=read_uint(r,"xmx",c->xmx);
     c->gc=read_uint(r,"gc",c->gc);
     if (!yyjson_is_obj(r) || !read_str(r,"version",c->version,sizeof(c->version)) ||
+        !read_str(r,"loaderVersion",c->loader_version,sizeof(c->loader_version)) ||
         !read_wide(r,"java",c->java,NMC_ARRAY(c->java)) || !read_wide(r,"jvm",c->jvm,NMC_ARRAY(c->jvm)))
         return ERR(NMC_JSON,L"instance configuration");
     return nmc_config_validate(c);
 }
 NmcError nmc_config_load(NmcConfig *c) {
     wchar_t path[NMC_PATH];
-    *c=(NmcConfig){.instance="default",.version="latest",.xms=512,.xmx=2048,.jobs=6,.exit_on_launch=true};
+    *c=(NmcConfig){.instance="default",.version="latest",.xms=256,.xmx=2048,.jobs=6,.exit_on_launch=true};
     MEMORYSTATUSEX mem={.dwLength=sizeof(mem)};
     if (GlobalMemoryStatusEx(&mem) && mem.ullTotalPhys>=UINT64_C(12000000000)) c->xmx=4096;
     CHECK(nmc_home(c->root)); CHECK(nmc_launcher_versions(c->versions_dir)); CHECK(config_path(path));
@@ -51,6 +56,7 @@ NmcError nmc_config_load(NmcConfig *c) {
     yyjson_val *r=yyjson_doc_get_root(doc);
     c->jobs=read_uint(r,"jobs",c->jobs);
     if (yyjson_is_bool(yyjson_obj_get(r,"exitOnLaunch"))) c->exit_on_launch=yyjson_get_bool(yyjson_obj_get(r,"exitOnLaunch"));
+    c->track_logs=yyjson_is_true(yyjson_obj_get(r,"trackLogs"));
     if (!read_str(r,"instance",c->instance,sizeof(c->instance)) ||
         !read_str(r,"account",c->account,sizeof(c->account)))
         e=ERR(NMC_JSON,L"launcher settings");
@@ -63,6 +69,8 @@ static bool fields(yyjson_mut_doc *d,yyjson_mut_val *r,const NmcConfig *c) {
     return nmc_utf8(c->java,java,sizeof(java)) && nmc_utf8(c->jvm,jvm,sizeof(jvm)) &&
         yyjson_mut_obj_add_strcpy(d,r,"java",java) && yyjson_mut_obj_add_strcpy(d,r,"jvm",jvm) &&
         yyjson_mut_obj_add_strcpy(d,r,"version",c->version) && yyjson_mut_obj_add_uint(d,r,"xms",c->xms) &&
+        yyjson_mut_obj_add_uint(d,r,"loader",c->loader) &&
+        yyjson_mut_obj_add_strcpy(d,r,"loaderVersion",c->loader_version) &&
         yyjson_mut_obj_add_uint(d,r,"xmx",c->xmx) && yyjson_mut_obj_add_uint(d,r,"gc",c->gc);
 }
 static NmcError write_config(const NmcConfig *c,const wchar_t *path,bool global) {
@@ -71,7 +79,8 @@ static NmcError write_config(const NmcConfig *c,const wchar_t *path,bool global)
     if (r && fields(d,r,c) && (!global ||
         (yyjson_mut_obj_add_strcpy(d,r,"instance",c->instance) && yyjson_mut_obj_add_strcpy(d,r,"account",c->account) &&
          yyjson_mut_obj_add_uint(d,r,"jobs",c->jobs) &&
-         yyjson_mut_obj_add_bool(d,r,"exitOnLaunch",c->exit_on_launch)))) {
+         yyjson_mut_obj_add_bool(d,r,"exitOnLaunch",c->exit_on_launch) &&
+         yyjson_mut_obj_add_bool(d,r,"trackLogs",c->track_logs)))) {
         yyjson_mut_doc_set_root(d,r);
         size_t n=0; char *json=yyjson_mut_write(d,YYJSON_WRITE_PRETTY,&n);
         if (json) { e=nmc_atomic(path,json,n); free(json); }
@@ -131,10 +140,11 @@ NmcError nmc_instances(const NmcConfig *c,NmcVersionInfo **out,size_t *count) {
     do {
         char id[NMC_ID]; NmcConfig tmp=*c;
         if (!(entry.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || (entry.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !nmc_utf8(entry.cFileName,id,sizeof(id)) || !safe_id(id) || nmc_instance_read(&tmp,id).code) continue;
+            !nmc_utf8(entry.cFileName,id,sizeof(id)) || !safe_id(id) || nmc_instance_read(&tmp,id).code ||
+            !nmc_installed(&tmp)) continue;
         if (!nmc_grow((void **)out,&cap,*count+1,sizeof(**out))) { e=ERR(NMC_MEMORY,L"instance list"); break; }
         NmcVersionInfo *v=&(*out)[(*count)++];
-        strcpy(v->id,id); strcpy(v->type,"instance");
+        strcpy(v->id,id); strcpy(v->type,tmp.version);
     } while (FindNextFileW(f,&entry));
     FindClose(f);
     if (e.code) { free(*out); *out=NULL; *count=0; }

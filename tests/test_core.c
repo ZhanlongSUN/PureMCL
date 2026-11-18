@@ -144,7 +144,7 @@ static bool process(void) {
     REQUIRE(exe_len && exe_len<NMC_PATH);
     REQUIRE(nmc_args_add(&args,L"--child") && nmc_args_add(&args,L"测试 \" 空格\\") && nmc_args_add(&args,dir));
     unsigned long pid=0;
-    REQUIRE(!nmc_spawn(exe,dir,&args,mark,&pid).code && pid);
+    REQUIRE(!nmc_spawn(exe,dir,&args,mark,&pid,NULL).code && pid);
     nmc_args_free(&args);
     HANDLE p=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE,FALSE,pid);
     REQUIRE(p);
@@ -185,7 +185,7 @@ static bool integration(const wchar_t *dir,const char *id,const wchar_t *mode) {
         nmc_args_free(&a);
         REQUIRE(nmc_args_add(&a,L"-version"));
         unsigned long pid=0;
-        REQUIRE(!nmc_spawn(java,p.game,&a,NULL,&pid).code && pid);
+        REQUIRE(!nmc_spawn(java,p.game,&a,NULL,&pid,NULL).code && pid);
         nmc_args_free(&a);
     }
     nmc_plan_free(&p);
@@ -197,26 +197,196 @@ static bool integration(const wchar_t *dir,const char *id,const wchar_t *mode) {
     return true;
 }
 static bool mirror_seen;
+static bool installed_and_uninstall(void) {
+    wchar_t dir[NMC_PATH], data[NMC_PATH], instance[NMC_PATH], file[NMC_PATH];
+    REQUIRE(make_dir(dir) && nmc_join(data,dir,L"data"));
+    NmcConfig c={.instance="one",.version="1.2.3",.xms=512,.xmx=2048,.jobs=6};
+    wcscpy_s(c.root,NMC_PATH,data);
+    REQUIRE(nmc_join(c.versions_dir,dir,L"versions"));
+    REQUIRE(nmc_path(file,c.versions_dir,"1.2.3/1.2.3.jar") && !nmc_atomic(file,"jar",3).code);
+    REQUIRE(nmc_path(file,c.versions_dir,"1.2.3/1.2.3.json") && !nmc_atomic(file,"{}",2).code);
+    REQUIRE(nmc_join(file,data,L"assets\\shared") && !nmc_atomic(file,"asset",5).code);
+    NmcVersionInfo *v=NULL; size_t n=0;
+    REQUIRE(!nmc_instance_create(&c).code && !nmc_instances(&c,&v,&n).code && !n);
+    free(v);
+    for (unsigned i=0;i<2;++i) {
+        strcpy_s(c.instance,sizeof(c.instance),i?"two":"one");
+        NmcPlan p={.base_version="1.2.3"};
+        REQUIRE(!nmc_game_instance(&c,c.version,p.instance).code &&
+            nmc_join(p.game,p.instance,L"game") && nmc_join(file,p.game,L"saves\\level.dat"));
+        REQUIRE(!nmc_atomic(file,"world",5).code && !nmc_mark_installed(&c,&p).code);
+    }
+    REQUIRE(!nmc_instances(&c,&v,&n).code && n==2);
+    free(v);
+    strcpy_s(c.instance,sizeof(c.instance),"one");
+    REQUIRE(!nmc_game_instance(&c,c.version,instance).code && !nmc_uninstall(&c,NULL).code);
+    REQUIRE(GetFileAttributesW(instance)==INVALID_FILE_ATTRIBUTES);
+    REQUIRE(!nmc_instances(&c,&v,&n).code && n==1 && !strcmp(v[0].id,"two"));
+    free(v);
+    uint64_t size;
+    REQUIRE(nmc_path(file,c.versions_dir,"1.2.3/1.2.3.jar") && nmc_file_size(file,&size));
+    strcpy_s(c.instance,sizeof(c.instance),"two");
+    REQUIRE(!nmc_uninstall(&c,NULL).code && !nmc_file_size(file,&size));
+    REQUIRE(nmc_join(file,data,L"assets\\shared") && nmc_file_size(file,&size) && size==5);
+    REQUIRE(!nmc_remove_tree(dir,c.root).code && !nmc_remove_tree(dir,c.versions_dir).code);
+    REQUIRE(RemoveDirectoryW(dir));
+    return true;
+}
+static bool bad_pack(void) {
+    wchar_t dir[NMC_PATH], source[NMC_PATH];
+    REQUIRE(make_dir(dir) && nmc_join(source,dir,L"bad.zip"));
+    mz_zip_archive z={0}; void *blob=NULL; size_t len=0;
+    REQUIRE(mz_zip_writer_init_heap(&z,0,0) &&
+        mz_zip_writer_add_mem(&z,"mods/xx/outside.txt","data",4,0) &&
+        mz_zip_writer_finalize_heap_archive(&z,&blob,&len));
+    char *bytes=blob;
+    const char name[]="mods/xx/outside.txt";
+    unsigned occurrences=0;
+    for (size_t i=0;i+sizeof(name)<=len;++i) if (!memcmp(bytes+i,name,sizeof(name)-1)) {
+        ++occurrences; bytes[i+5]='.'; bytes[i+6]='.';
+    }
+    REQUIRE(occurrences==2 && !nmc_atomic(source,blob,len).code);
+    mz_free(blob); mz_zip_writer_end(&z);
+    NmcConfig c={.instance="bad-pack",.version="1.2.3",.xms=512,.xmx=2048,.jobs=6};
+    REQUIRE(nmc_join(c.root,dir,L"data") && nmc_join(c.versions_dir,dir,L"versions"));
+    NmcError e=nmc_import_pack(&c,source,NULL);
+    if (e.code!=NMC_PATH_ERROR) fwprintf(stderr,L"bad pack: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
+    REQUIRE(e.code==NMC_PATH_ERROR && GetFileAttributesW(c.versions_dir)==INVALID_FILE_ATTRIBUTES);
+    REQUIRE(DeleteFileW(source) && RemoveDirectoryW(dir));
+    return true;
+}
+static void report(void *unused,NmcStage stage,size_t current,size_t total) {
+    (void)unused;
+    if (!current || current==total) fwprintf(stderr,L"stage %u: %zu / %zu\n",(unsigned)stage,current,total);
+}
+static bool install_extra(int argc,wchar_t **argv) {
+    NmcConfig c={.xms=512,.xmx=2048,.jobs=10};
+    REQUIRE(wcslen(argv[2])<NMC_PATH);
+    wcscpy_s(c.root,NMC_PATH,argv[2]);
+    REQUIRE(nmc_join(c.versions_dir,c.root,L"versions") &&
+        nmc_utf8(argv[3],c.version,sizeof(c.version)) && nmc_utf8(argv[4],c.instance,sizeof(c.instance)));
+    NmcTask task={.progress=report}; nmc_task_reset(&task);
+    NmcError e;
+    if (!wcscmp(argv[1],L"--import")) e=nmc_import_pack(&c,argv[5],&task);
+    else if (!wcscmp(argv[1],L"--check-loader")) e=nmc_instance_read(&c,c.instance);
+    else {
+        c.loader=(NmcLoader)wcstoul(argv[5],NULL,10);
+        if (argc==7) REQUIRE(nmc_utf8(argv[6],c.loader_version,sizeof(c.loader_version)));
+        e=nmc_run(&c,NMC_INSTALL,&task,NULL);
+    }
+    if (e.code) fwprintf(stderr,L"install: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
+    REQUIRE(!e.code && !nmc_instance_read(&c,c.instance).code && nmc_installed(&c));
+    NmcPlan p={0}; e=nmc_plan(&c,false,&task,&p);
+    if (e.code) fwprintf(stderr,L"plan: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
+    REQUIRE(!e.code && !nmc_assets_ready(&p).code);
+    NmcSession test={.player={.id="01234567890123456789012345678901",.name="Fixture"},
+        .token="fixture-only",.client="01234567-89ab-cdef-0123-456789abcdef"};
+    NmcArgs args={0}; e=nmc_args_build(&c,&p,&test,&args);
+    if (e.code) fwprintf(stderr,L"args: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
+    REQUIRE(!e.code && args.n>10);
+    printf("%s %s %s; %zu runtime arguments\n",c.version,c.loader_version,p.main_class,args.n);
+    if (c.loader!=NMC_VANILLA && p.java_major>=17) {
+        wchar_t java[NMC_PATH], main_class[256];
+        NmcArgs verify={0};
+        REQUIRE(!nmc_runtime(&c,&p,false,false,&task,java).code &&
+            nmc_utf16(p.main_class,main_class,NMC_ARRAY(main_class)) && nmc_args_add(&verify,L"--dry-run"));
+        bool found=false;
+        for (size_t i=0;i<args.n;++i) {
+            REQUIRE(nmc_args_add(&verify,args.v[i]));
+            if (!wcscmp(args.v[i],main_class)) { found=true; break; }
+        }
+        REQUIRE(found);
+        /* Stop after Java loads the main class, without game arguments or an account. */
+        e=nmc_run_helper(java,p.game,&verify,&task);
+        nmc_args_free(&verify);
+        if (e.code) fwprintf(stderr,L"JVM dry run: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
+        REQUIRE(!e.code);
+    }
+    nmc_args_free(&args); nmc_plan_free(&p); return true;
+}
+typedef struct {
+    NmcError errors[2];
+    unsigned sources;
+} RouteFixture;
+static NmcError fake_transfer(void *ctx,bool mirror) {
+    RouteFixture *f=ctx;
+    f->sources=f->sources*10+(mirror?2u:1u);
+    return f->errors[mirror];
+}
+static bool download_routes(void) {
+    const char digest[]="b62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356";
+    const char storage[]="https://download.mocdn.net/bmclapi/download/b6/"
+        "b62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356?X-Amz-Signature=fixture";
+    REQUIRE(nmc_bmcl_storage_url(storage,digest));
+    REQUIRE(!nmc_bmcl_storage_url(storage,"a62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356"));
+    REQUIRE(!nmc_bmcl_storage_url("https://download.mocdn.net/unrelated?X-Amz-Signature=fixture",digest));
+    const char mainland[]="{\"country_code\":\"CN\"}";
+    REQUIRE(nmc_geo_is_mainland(mainland,sizeof(mainland)-1));
+    const char *const other[]={
+        "{\"country_code\":\"HK\"}", "{\"country_code\":\"MO\"}", "{\"country_code\":\"TW\"}",
+        "{\"country_code\":\"US\"}", "{\"country\":\"CN\"}", "{\"country_code\":\"CN\""
+    };
+    for (size_t i=0;i<NMC_ARRAY(other);++i) REQUIRE(!nmc_geo_is_mainland(other[i],strlen(other[i])));
+
+    NmcTask task={0}; nmc_task_reset(&task);
+    RouteFixture f={0};
+    REQUIRE(!nmc_transfer_route(&task,1,NMC_REGION_MAINLAND,fake_transfer,&f).code && f.sources==2);
+    f=(RouteFixture){.errors={{NMC_HTTP,12002,L"stalled official download"},OK}};
+    REQUIRE(nmc_transfer_route(&task,1,NMC_REGION_OFFICIAL,fake_transfer,&f).detail==12002 && f.sources==1);
+    f=(RouteFixture){.errors={OK,{NMC_HTTP,12002,L"stalled mirror download"}}};
+    REQUIRE(!nmc_transfer_route(&task,1,NMC_REGION_MAINLAND,fake_transfer,&f).code && f.sources==21);
+    f=(RouteFixture){0};
+    REQUIRE(!nmc_transfer_route(&task,1,NMC_REGION_MAINLAND,fake_transfer,&f).code && f.sources==1);
+    f=(RouteFixture){0};
+    REQUIRE(!nmc_transfer_route(&task,2,NMC_REGION_MAINLAND,fake_transfer,&f).code && f.sources==2);
+    f=(RouteFixture){0};
+    REQUIRE(!nmc_transfer_route(&task,0,NMC_REGION_MAINLAND,fake_transfer,&f).code && f.sources==1);
+    return true;
+}
+typedef struct { size_t seen; unsigned tail; } TailFixture;
+static void record_tail(void *ctx,NmcStage stage,size_t done,size_t total) {
+    TailFixture *f=ctx;
+    if (stage==NMC_STAGE_ASSETS && total==127) {
+        if (done>=112 && done==f->seen+1) ++f->tail;
+        f->seen=done;
+    }
+}
+static NmcError available_file(void *ctx,size_t i,NmcTask *t) {
+    (void)ctx; (void)i; (void)t; return OK;
+}
+static bool download_progress(void) {
+    TailFixture f={0};
+    NmcTask task={.progress=record_tail,.user=&f}; nmc_task_reset(&task);
+    REQUIRE(!nmc_parallel(127,4,NMC_STAGE_ASSETS,&task,available_file,NULL).code);
+    REQUIRE(f.seen==127 && f.tail>=15);
+    return true;
+}
 static void on_mirror(void *unused) { (void)unused; mirror_seen=true; }
-static bool check_mirror(const wchar_t *dir,const wchar_t *sha,const wchar_t *size,const wchar_t *url) {
-    NmcFile file={0}; NmcTask task={.mirror=on_mirror}; nmc_task_reset(&task);
+static void observe_transfer(void *unused,uint64_t bytes) { (void)unused; (void)bytes; }
+static bool check_mirror(const wchar_t *dir,const wchar_t *sha,const wchar_t *size,const wchar_t *url,bool force) {
+    NmcFile file={0}; NmcTask task={.mirror=on_mirror,.transfer=observe_transfer}; nmc_task_reset(&task);
     REQUIRE(nmc_utf8(sha,file.hash,sizeof(file.hash)) && nmc_utf8(url,file.url,sizeof(file.url)));
     wchar_t *end=NULL;
     file.size=wcstoull(size,&end,10);
     REQUIRE(end && !*end && file.size>0 && nmc_join(file.path,dir,L"bmclapi-verified-download"));
     char mirror[2048]; unsigned group=nmc_mirror_url(file.url,mirror);
     REQUIRE(group);
-    atomic_store(&task.mirror_hosts,group);
+    if (force) atomic_store(&task.download_region,NMC_REGION_MAINLAND);
     NmcError e=nmc_http_file(&file,&task);
     if (e.code) fwprintf(stderr,L"mirror transfer: %u %lu %ls\n",(unsigned)e.code,e.detail,e.where?e.where:L"");
     REQUIRE(!e.code && !nmc_check_file(&file,true,NULL).code);
-    REQUIRE(mirror_seen);
-    puts("Verified BMCLAPI transfer against the official digest.");
+    if (force) REQUIRE(mirror_seen);
+    if (atomic_load(&task.download_region)==NMC_REGION_OFFICIAL) REQUIRE(!mirror_seen);
+    printf("Selected %s; verified official digest; received %llu bytes.\n",
+        mirror_seen?"BMCLAPI":"Mojang",atomic_load(&task.received_bytes));
     return true;
 }
 int wmain(int argc,wchar_t **argv) {
-    if (argc==6 && !wcscmp(argv[1],L"--mirror-check"))
-        return check_mirror(argv[2],argv[3],argv[4],argv[5]) ? 0 : 1;
+    if (((argc==6 || argc==7) && (!wcscmp(argv[1],L"--loader") || !wcscmp(argv[1],L"--import"))) ||
+        (argc==5 && !wcscmp(argv[1],L"--check-loader")))
+        return install_extra(argc,argv)?0:1;
+    if (argc==6 && (!wcscmp(argv[1],L"--mirror-check") || !wcscmp(argv[1],L"--source-check")))
+        return check_mirror(argv[2],argv[3],argv[4],argv[5],!wcscmp(argv[1],L"--mirror-check")) ? 0 : 1;
     if (argc==4 && !wcscmp(argv[1],L"--child")) {
         wchar_t dir[NMC_PATH];
         DWORD len=GetCurrentDirectoryW(NMC_PATH,dir);
@@ -227,6 +397,7 @@ int wmain(int argc,wchar_t **argv) {
         char id[NMC_ID];
         return nmc_utf8(argv[2],id,sizeof(id)) && integration(argv[1],id,argc==4?argv[3]:L"plan") ? 0 : 1;
     }
-    return paths() && isolation() && quotes() && rules() && disk() && arguments() && native_receipt() && process() ? 0 : 1;
+    return paths() && isolation() && quotes() && rules() && disk() && arguments() && native_receipt() && process() &&
+        installed_and_uninstall() && bad_pack() && download_routes() && download_progress() ? 0 : 1;
 }
 

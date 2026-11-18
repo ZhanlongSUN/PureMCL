@@ -12,7 +12,17 @@ int main(void) {
         bool created=r.target && r.mark && r.title && r.caption;
         SetWindowPos(w,NULL,0,0,700,570,SWP_NOZORDER|SWP_NOACTIVATE);
         nmc_renderer_draw(&r,w,96,true,L"Dark",L"Resize");
-        if (created && r.target && r.mark && r.pixels.width==700) result=0;
+        created=created && r.target && r.mark && r.pixels.width==700;
+        const UINT scales[]={144,192};
+        for (size_t i=0;i<NMC_ARRAY(scales) && created;++i) {
+            int width=MulDiv(570,(int)scales[i],96), height=MulDiv(550,(int)scales[i],96);
+            nmc_renderer_reset(&r);
+            SetWindowPos(w,NULL,0,0,width,height,SWP_NOZORDER|SWP_NOACTIVATE);
+            nmc_renderer_draw(&r,w,scales[i],true,L"在系统浏览器完成微软验证",
+                              L"验证代码：TEST-000\nhttps://example.invalid/device");
+            created=r.target && r.mark && r.pixels.width==(UINT32)width && r.pixels.height==(UINT32)height;
+        }
+        if (created) result=0;
         nmc_renderer_free(&r); DestroyWindow(w);
     }
     CoUninitialize();

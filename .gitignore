@@ -3,3 +3,9 @@
 /cmake-build-*/
 /.idea/
 /CMakeUserPresets.json
+/yyjson-0.13.0.zip
+/miniz-3.1.2.zip
+/sqlite-dll-win-x64-3540100.zip
+/AGENTS.md
+/README.md
+/build-msvc.cmd

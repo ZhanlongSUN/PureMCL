@@ -1,7 +1,9 @@
 #include "ui.h"
 #include "graphics_abi.h"
+#include "resource.h"
 
 #define RELEASE(i,method) do { if (i) { method(i); (i)=NULL; } } while (0)
+static const wchar_t HEADER_CAPTION[]=L"A Pure Way to Treat Your PC to a Cup of Coffee.";
 static D2D1_COLOR_F color(unsigned rgb) {
     return (D2D1_COLOR_F){(float)((rgb>>16)&255)/255.0f,(float)((rgb>>8)&255)/255.0f,(float)(rgb&255)/255.0f,1.0f};
 }
@@ -28,7 +30,7 @@ void nmc_renderer_free(NmcRenderer *r) {
 static void bitmap(NmcRenderer *r) {
     if (!r->wic) return;
     HMODULE mod=GetModuleHandleW(NULL);
-    HRSRC res=FindResourceW(mod,MAKEINTRESOURCEW(101),RT_RCDATA);
+    HRSRC res=FindResourceW(mod,MAKEINTRESOURCEW(IDR_MARK_PNG),RT_RCDATA);
     if (!res) return;
     HGLOBAL bytes=LoadResource(mod,res);
     BYTE *ptr=bytes?LockResource(bytes):NULL;
@@ -85,13 +87,18 @@ void nmc_renderer_draw(NmcRenderer *r,HWND w,UINT dpi,bool dark,const wchar_t *s
             fill(r,(D2D1_RECT_F){0,0,x,110},dark?0x142820:0xe5efe8);
             fill(r,(D2D1_RECT_F){0,108,x,110},dark?0x4fbb86:0x25835c);
             if (r->mark) {
-                D2D1_RECT_F rect={24,24,76,76};
-                ID2D1HwndRenderTarget_DrawBitmap(r->target,r->mark,&rect,1.0f,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,NULL);
+                /* Align the pixel-art mark to physical pixels at any DPI. */
+                float dips_per_pixel=96.0f/(float)dpi;
+                float start=(float)MulDiv(24,(int)dpi,96)*dips_per_pixel;
+                float end=(float)MulDiv(76,(int)dpi,96)*dips_per_pixel;
+                D2D1_RECT_F rect={start,start,end,end};
+                ID2D1HwndRenderTarget_DrawBitmap(r->target,r->mark,&rect,1.0f,
+                                                 D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,NULL);
             }
             draw(r,L"PureMCL",r->title,(D2D1_RECT_F){90,17,x-20,59},dark?0xf3fbf7:0x15372a);
-            draw(r,L"MINECRAFT  /  JAVA EDITION",r->caption,(D2D1_RECT_F){92,62,x-20,86},dark?0xafcbbd:0x426355);
-            draw(r,status,r->caption,(D2D1_RECT_F){26,y-94,x-22,y-70},dark?0xf1f5f3:0x193429);
-            draw(r,sub,r->caption,(D2D1_RECT_F){26,y-67,x-22,y-44},dark?0xb1c5bc:0x426355);
+            draw(r,HEADER_CAPTION,r->caption,(D2D1_RECT_F){92,62,x-20,86},dark?0xafcbbd:0x426355);
+            draw(r,status,r->caption,(D2D1_RECT_F){26,y-NMC_STATUS_HEIGHT,x-22,y-79},dark?0xf1f5f3:0x193429);
+            draw(r,sub,r->caption,(D2D1_RECT_F){26,y-77,x-22,y-38},dark?0xb1c5bc:0x426355);
             if (ID2D1HwndRenderTarget_EndDraw(r->target,NULL,NULL)==D2DERR_RECREATE_TARGET) {
                 nmc_renderer_reset(r); InvalidateRect(w,NULL,FALSE);
             }
@@ -99,7 +106,18 @@ void nmc_renderer_draw(NmcRenderer *r,HWND w,UINT dpi,bool dark,const wchar_t *s
             FillRect(dc,&px,GetSysColorBrush(COLOR_WINDOW));
             SetBkMode(dc,TRANSPARENT);
             TextOutW(dc,24,26,L"PureMCL",7);
-            TextOutW(dc,24,px.bottom-MulDiv(94,(int)dpi,96),status,(int)wcslen(status));
+            TextOutW(dc,24,26+MulDiv(24,(int)dpi,96),HEADER_CAPTION,(int)(NMC_ARRAY(HEADER_CAPTION)-1));
+            RECT status_box={MulDiv(26,(int)dpi,96),px.bottom-MulDiv(NMC_STATUS_HEIGHT,(int)dpi,96),
+                             px.right-MulDiv(22,(int)dpi,96),px.bottom-MulDiv(79,(int)dpi,96)};
+            RECT details={status_box.left,px.bottom-MulDiv(77,(int)dpi,96),status_box.right,
+                          px.bottom-MulDiv(38,(int)dpi,96)};
+            HFONT font=CreateFontW(-MulDiv(13,(int)dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+                                  DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+            HGDIOBJ previous=font?SelectObject(dc,font):NULL;
+            DrawTextW(dc,status,-1,&status_box,DT_WORDBREAK|DT_NOPREFIX);
+            DrawTextW(dc,sub,-1,&details,DT_WORDBREAK|DT_NOPREFIX);
+            if (previous) SelectObject(dc,previous);
+            if (font) DeleteObject(font);
         }
     }
     EndPaint(w,&ps);

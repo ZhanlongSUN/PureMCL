@@ -166,10 +166,12 @@ static NmcError libraries(const NmcConfig *c,NmcPlan *p) {
             if (!nmc_args_add(&overridden,wkey)) { e=ERR(NMC_MEMORY,L"library overrides"); goto done; }
             yyjson_val *downloads=yyjson_obj_get(lib,"downloads"), *artifact=yyjson_obj_get(downloads,"artifact");
             const char *classifier=nmc_str(yyjson_obj_get(lib,"natives"),"windows");
-            if (!artifact && !classifier) { e=ERR(NMC_UNSUPPORTED,L"library without verified download"); goto done; }
+            bool loader_layer=layer==0 && c->loader!=NMC_VANILLA;
+            if (!artifact && !classifier && !loader_layer) { e=ERR(NMC_UNSUPPORTED,L"library without verified download"); goto done; }
             NmcFile f={0};
-            if (artifact) {
-                TRY(nmc_file_meta(&f,dir,nmc_str(artifact,"path"),artifact));
+            if (artifact || (loader_layer && !classifier)) {
+                if (loader_layer) TRY(nmc_loader_library(lib,p->loader_libs,&f));
+                else TRY(nmc_file_meta(&f,dir,nmc_str(artifact,"path"),artifact));
                 TRY(add_file(&p->files,&f,true)); TRY(add_cp(&p->classpath,f.path));
             }
             if (classifier) {
@@ -216,6 +218,7 @@ NmcError nmc_plan(const NmcConfig *c,bool online,NmcTask *t,NmcPlan *p) {
         !p->main_class[0] || !nmc_copy(p->type,sizeof(p->type),string_field(p,"type"))) {
         e=ERR(NMC_JSON,L"launch metadata"); goto done;
     }
+    strcpy(p->base_version,ids[0]);
     yyjson_val *java=field(p,"javaVersion"), *asset=field(p,"assetIndex");
     uint64_t major=java?yyjson_get_uint(yyjson_obj_get(java,"majorVersion")):8;
     const char *component=java?nmc_str(java,"component"):"jre-legacy";
@@ -235,7 +238,6 @@ NmcError nmc_plan(const NmcConfig *c,bool online,NmcTask *t,NmcPlan *p) {
     TRY(nmc_file_meta(&p->asset_index,p->assets,rel,asset));
     p->legacy_assets=!strcmp(asset_id,"legacy") || !strcmp(asset_id,"pre-1.6");
     p->map_assets=!strcmp(asset_id,"pre-1.6");
-    TRY(libraries(c,p));
     yyjson_val *client=NULL; const char *jar=string_field(p,"jar");
     for (size_t i=0;i<p->count;++i) {
         if (jar && strcmp(jar,ids[i])) continue;
@@ -246,7 +248,10 @@ NmcError nmc_plan(const NmcConfig *c,bool online,NmcTask *t,NmcPlan *p) {
     snprintf(rel,sizeof(rel),"%s/%s.jar",id,id);
     NmcFile f={0};
     TRY(nmc_file_meta(&f,c->versions_dir,rel,client));
-    TRY(add_file(&p->files,&f,true)); TRY(add_cp(&p->classpath,f.path));
+    TRY(add_file(&p->files,&f,true));
+    TRY(nmc_loader_plan(c,online,t,p));
+    TRY(libraries(c,p));
+    TRY(add_cp(&p->classpath,f.path));
     yyjson_val *logging=yyjson_obj_get(field(p,"logging"),"client");
     if (logging) {
         yyjson_val *log=yyjson_obj_get(logging,"file"); const char *log_id=nmc_str(log,"id");
@@ -271,7 +276,7 @@ static bool stamp_matches(const wchar_t *stamp,const char *hash) {
 static bool asset_stamp(const NmcPlan *p,wchar_t out[NMC_PATH]) {
     char name[NMC_ID+24];
     snprintf(name,sizeof(name),".pure-assets-%s",p->asset_id);
-    return nmc_path(out,p->game,name);
+    return nmc_path(out,p->map_assets?p->game:p->assets,name);
 }
 NmcError nmc_assets_ready(const NmcPlan *p) {
     wchar_t stamp[NMC_PATH], objects[NMC_PATH];
@@ -279,9 +284,32 @@ NmcError nmc_assets_ready(const NmcPlan *p) {
         return ERR(NMC_PATH_ERROR,L"asset receipt path");
     CHECK(nmc_check_file(&p->asset_index,false,NULL));
     DWORD attr=GetFileAttributesW(objects);
+    wchar_t old_stamp[NMC_PATH]; char name[NMC_ID+24];
+    snprintf(name,sizeof(name),".pure-assets-%s",p->asset_id);
+    bool complete=stamp_matches(stamp,p->asset_index.hash) ||
+        (nmc_path(old_stamp,p->game,name) && stamp_matches(old_stamp,p->asset_index.hash));
     return attr!=INVALID_FILE_ATTRIBUTES && (attr&FILE_ATTRIBUTE_DIRECTORY) &&
-        !(attr&FILE_ATTRIBUTE_REPARSE_POINT) && stamp_matches(stamp,p->asset_index.hash)
+        !(attr&FILE_ATTRIBUTE_REPARSE_POINT) && complete
         ? OK : ERR(NMC_MISSING,L"asset receipt or objects");
+}
+typedef struct { const char *hash,*name; uint64_t size; } Asset;
+typedef struct { const Asset *assets; const wchar_t *root; bool verify; } AssetBatch;
+static int compare_asset(const void *a,const void *b) {
+    return strcmp(((const Asset *)a)->hash,((const Asset *)b)->hash);
+}
+static NmcError object_file(const wchar_t *root,const Asset *asset,NmcFile *file) {
+    char rel[64];
+    snprintf(rel,sizeof(rel),"objects/%.2s/%s",asset->hash,asset->hash);
+    if (!nmc_path(file->path,root,rel)) return ERR(NMC_PATH_ERROR,L"asset path");
+    snprintf(file->url,sizeof(file->url),"https://resources.download.minecraft.net/%.2s/%s",asset->hash,asset->hash);
+    strcpy(file->hash,asset->hash); file->size=asset->size;
+    return OK;
+}
+static NmcError download_asset(void *data,size_t i,NmcTask *t) {
+    AssetBatch *batch=data;
+    NmcFile file={0};
+    CHECK(object_file(batch->root,&batch->assets[i],&file));
+    return nmc_fetch(&file,batch->verify,t);
 }
 NmcError nmc_assets(const NmcConfig *c,const NmcPlan *p,bool verify,NmcTask *t) {
     wchar_t stamp[NMC_PATH], virtual_dir[NMC_PATH], resources[NMC_PATH];
@@ -291,7 +319,8 @@ NmcError nmc_assets(const NmcConfig *c,const NmcPlan *p,bool verify,NmcTask *t) 
         !asset_stamp(p,stamp)) return ERR(NMC_PATH_ERROR,L"asset paths");
     CHECK(nmc_fetch(&p->asset_index,true,t));
     if (!verify && !nmc_assets_ready(p).code) return OK;
-    NmcFiles files={0}; yyjson_doc *doc=NULL; NmcError e=OK;
+    Asset *all=NULL,*unique=NULL;
+    yyjson_doc *doc=NULL; NmcError e=OK;
     TRY(nmc_json(p->asset_index.path,&doc));
     yyjson_val *root=yyjson_doc_get_root(doc), *objs=yyjson_obj_get(root,"objects");
     bool virt=yyjson_is_true(yyjson_obj_get(root,"virtual")), mapped=yyjson_is_true(yyjson_obj_get(root,"map_to_resources"));
@@ -299,48 +328,43 @@ NmcError nmc_assets(const NmcConfig *c,const NmcPlan *p,bool verify,NmcTask *t) 
     wchar_t objects[NMC_PATH];
     if (!nmc_join(objects,p->assets,L"objects")) { e=ERR(NMC_PATH_ERROR,L"asset objects directory"); goto done; }
     TRY(nmc_mkdir(objects));
+    size_t count=yyjson_obj_size(objs);
+    all=calloc(count?count:1,sizeof(*all)); unique=calloc(count?count:1,sizeof(*unique));
+    if (!all || !unique) { e=ERR(NMC_MEMORY,L"asset work list"); goto done; }
     yyjson_val *k,*v; size_t i,n;
-    size_t processed=0;
-    nmc_progress(t,NMC_STAGE_ASSETS,0,yyjson_obj_size(objs));
     yyjson_obj_foreach(objs,i,n,k,v) {
         if (nmc_cancelled(t)) { e=ERR(NMC_CANCELLED,L"asset index"); goto done; }
         const char *hash=nmc_str(v,"hash"); yyjson_val *size=yyjson_obj_get(v,"size");
         if (!nmc_hex(hash,40) || !yyjson_is_uint(size) || yyjson_get_uint(size)>UINT64_C(4294967296)) {
             e=ERR(NMC_JSON,L"asset object"); goto done;
         }
-        char asset[64]; NmcFile f={0};
-        snprintf(asset,sizeof(asset),"objects/%.2s/%s",hash,hash);
-        if (!nmc_path(f.path,p->assets,asset)) { e=ERR(NMC_PATH_ERROR,L"asset path"); goto done; }
-        snprintf(f.url,sizeof(f.url),"https://resources.download.minecraft.net/%.2s/%s",hash,hash);
-        strcpy(f.hash,hash); f.size=yyjson_get_uint(size);
-        if (virt || mapped) {
-            const char *name=yyjson_get_str(k); wchar_t dest[NMC_PATH];
-            if (!name || strlen(name)!=yyjson_get_len(k)) { e=ERR(NMC_JSON,L"legacy asset name"); goto done; }
-            TRY(nmc_fetch(&f,verify,t));
-            const wchar_t *bases[]={virt?virtual_dir:NULL,mapped?resources:NULL};
-            for (size_t j=0;j<NMC_ARRAY(bases);++j) if (bases[j]) {
-                if (!nmc_path(dest,bases[j],name)) { e=ERR(NMC_PATH_ERROR,L"legacy asset destination"); goto done; }
-                NmcFile copy=f; wcscpy(copy.path,dest);
-                if (!nmc_check_file(&copy,true,t).code) continue;
-                NmcBytes b={0}; TRY(nmc_read(f.path,64*1024*1024,&b));
-                e=nmc_atomic(dest,b.data,b.len); free(b.data);
-                if (e.code) goto done;
-            }
-        } else {
-            TRY(add_file(&files,&f,true));
-            if (files.n==256 || i+1==n) {
-                TRY(nmc_batch_part(&files,c->jobs,verify,NMC_STAGE_ASSETS,t,processed,n));
-                files.n=0;
-                processed=i+1;
-                nmc_progress(t,NMC_STAGE_ASSETS,processed,n);
-            }
+        const char *name=yyjson_get_str(k);
+        if (!name || strlen(name)!=yyjson_get_len(k)) { e=ERR(NMC_JSON,L"asset name"); goto done; }
+        all[i]=(Asset){hash,name,yyjson_get_uint(size)};
+    }
+    memcpy(unique,all,count*sizeof(*unique));
+    qsort(unique,count,sizeof(*unique),compare_asset);
+    size_t jobs=0;
+    for (i=0;i<count;++i) {
+        if (jobs && !strcmp(unique[jobs-1].hash,unique[i].hash)) {
+            if (unique[jobs-1].size!=unique[i].size) { e=ERR(NMC_JSON,L"asset size conflict"); goto done; }
+        } else unique[jobs++]=unique[i];
+    }
+    AssetBatch batch={unique,p->assets,verify};
+    TRY(nmc_parallel(jobs,c->jobs,NMC_STAGE_ASSETS,t,download_asset,&batch));
+    if (virt || mapped) for (i=0;i<count;++i) {
+        const wchar_t *bases[]={virt?virtual_dir:NULL,mapped?resources:NULL};
+        NmcFile file={0}; TRY(object_file(p->assets,&all[i],&file));
+        for (size_t j=0;j<NMC_ARRAY(bases);++j) if (bases[j]) {
+            NmcFile copy=file;
+            if (!nmc_path(copy.path,bases[j],all[i].name)) { e=ERR(NMC_PATH_ERROR,L"legacy asset destination"); goto done; }
+            if (!nmc_check_file(&copy,verify,t).code) continue;
+            TRY(nmc_copy_file(file.path,copy.path,t));
         }
-        if ((virt || mapped) && ((i+1)%64==0 || i+1==n))
-            nmc_progress(t,NMC_STAGE_ASSETS,i+1,n);
     }
     TRY(nmc_atomic(stamp,p->asset_index.hash,strlen(p->asset_index.hash)));
 done:
-    free(files.v); yyjson_doc_free(doc); return e;
+    free(unique); free(all); yyjson_doc_free(doc); return e;
 }
 NmcError nmc_natives(const NmcPlan *p,bool verify,NmcTask *t) {
     if (!p->native_zips.n) return nmc_mkdir(p->natives);
