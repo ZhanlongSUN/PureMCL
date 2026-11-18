@@ -1,6 +1,6 @@
 # PureMCL
 
-面向 Windows 11 x64 的非官方 Minecraft Java Edition 启动器。
+面向 Windows 的非官方 Minecraft Java Edition 启动器。
 
 ## 使用
 
